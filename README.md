@@ -2,52 +2,52 @@
 
 ## Approach
 
-Every message is grounded in all four context layers before a word is written. The architecture has two parts:
+Every message is grounded in all four context layers before a word is written.
 
-**1. Trigger-kind dispatch** — 25 named trigger kinds each have a dedicated composition frame (in `TRIGGER_FRAMES`). The frame tells the LLM exactly *what to lead with*, *what to anchor on*, and *what CTA shape to use* for that specific kind. This prevents the model from writing generic nudges and forces specificity: a `research_digest` frame says "lead with exact title + source + trial_n from the digest item"; an `ipl_match_today` frame carries the counter-intuitive insight (Saturday = delivery, not dine-in) directly in the prompt.
+**1. Trigger-kind dispatch** — 25 named trigger kinds each have a dedicated composition frame. Each frame tells the model exactly what to lead with, what to anchor on, and what CTA shape to use. A `research_digest` frame says "lead with exact title + source + trial_n from the digest item." An `ipl_match_today` frame carries the counter-intuitive insight (Saturday = push delivery, not dine-in) directly in the prompt. This prevents generic nudges and forces specificity.
 
-**2. Context-grounded system prompt** — All four layers are injected with their real values: peer_stats numbers, merchant's exact CTR vs peer median, active offer titles, customer's language preference, trigger payload fields. The model has no room to invent — everything it cites comes from the provided JSON.
+**2. Four-layer context injection** — All four layers are injected with real values: peer_stats numbers, merchant's exact CTR vs peer median, active offer titles, customer's language preference, trigger payload fields. The model has no room to invent — everything it cites comes from the provided JSON.
 
-**Reply handling** covers the five cases the judge tests: auto-reply detection (probe once → wait 24h → end), hostile exit, hard reject, explicit intent transition (switches to action mode immediately, never asks another qualifying question), and out-of-scope deflection.
+**3. Reply handling** — Covers five cases the judge tests: auto-reply detection (probe once → end on second), hostile exit, hard reject, explicit intent transition (switches to action mode immediately, no more qualifying questions), and out-of-scope deflection.
 
-## Model choice
+## Model Choice
 
-`claude-sonnet-4-20250514` at `temperature=0`. Fast (sub-5s), reliable structured JSON output, strong instruction-following on the anti-patterns list.
+**llama-3.3-70b-versatile via Groq** — fast (~200 tokens/sec), reliable structured JSON output at temperature=0, strong instruction-following on the anti-patterns list. Free tier is sufficient for the evaluation window. temperature=0 ensures determinism — same input always produces same output.
 
 ## Tradeoffs
 
-- **In-memory state** — context stored in Python dicts. Fine for a 3-day evaluation window; would use Redis in production.
-- **Single LLM call per composition** — no retrieval layer. The full category context (digest, offers, peer_stats, voice) fits in one prompt at ~1,500 tokens. For larger category contexts, a retrieval step over digest items would be the first upgrade.
-- **Suppression is 24h per key** — conservative to avoid re-sending on the same trigger. The judge can inject new trigger versions to re-fire.
+**In-memory state** — Context stored in Python dicts. Fine for a 3-day evaluation window. Production would use Redis with TTL matching the engagement loop frequency (~30 min for active conversations, ~24h for suppression keys).
 
-## What additional context would have helped
+**Single LLM call per composition** — No retrieval layer. The full category context (digest, offers, peer_stats, voice) fits in one prompt at ~1,500 tokens. For larger category contexts, a retrieval step over digest items would be the first upgrade.
 
-1. The merchant's actual conversation history beyond the last 2 turns — knowing whether they've accepted/rejected similar triggers before would improve decision quality significantly.
-2. Real-time slot availability for recall/booking triggers (the dataset has static slots; production would need a live calendar lookup).
-3. The `customer_aggregate.high_risk_adult_count` field is the single most useful signal for dentist category personalization — more category-specific aggregates like this across all verticals would unlock much sharper merchant-fit scoring.
+**Suppression is 24h per key** — Conservative to avoid re-sending on the same trigger. The judge can inject new trigger versions with a different suppression key to re-fire.
 
-## Running locally
+**Groq free tier** — Rate limits are sufficient for the judge harness (30 canonical test pairs + replay scenarios). If rate limits are hit, the fallback response is a generic but safe message that doesn't fabricate data.
+
+## Scoring Design
+
+| Dimension | How this bot addresses it |
+|---|---|
+| Decision quality | Trigger kind + merchant state + category profile all evaluated before writing |
+| Specificity | Real numbers (₹299, 190 searches, 12 inactive days) pulled directly from payload |
+| Category fit | 25 trigger frames enforce tone, avoid-list, and CTA pattern per vertical |
+| Merchant fit | Offer catalog + performance metrics + conversation history injected every call |
+| Engagement compulsion | Single CTA enforced, compulsion levers listed, Hinglish where natural |
+
+## Running Locally
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
 pip install -r requirements.txt
-
-# Start HTTP server (for judge harness)
+export GROQ_API_KEY=gsk_...
 uvicorn main:app --host 0.0.0.0 --port 8080
-
-# Generate submission.jsonl (30 test pairs)
-cd vera-v2 && python generate_submission.py
-
-# Run judge simulator
-python judge_simulator.py  # set BOT_URL + LLM_API_KEY in the file first
 ```
 
-## Deploy (Railway — 5 min)
+## Endpoints
 
-```bash
-npm install -g @railway/cli
-railway login && railway init
-railway variables set ANTHROPIC_API_KEY=sk-ant-...
-railway up
-railway domain  # → your public URL
-```
+| Endpoint | Purpose |
+|---|---|
+| GET /v1/healthz | Liveness check |
+| GET /v1/metadata | Bot identity |
+| POST /v1/context | Push category/merchant/customer/trigger context |
+| POST /v1/tick | Compose next message from stored context |
+| POST /v1/reply | Handle merchant reply and continue session |
